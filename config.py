@@ -20,11 +20,12 @@ HH_OAUTH_CLIENT_SECRET = os.getenv('HH_OAUTH_CLIENT_SECRET')
 HH_ACCESS_TOKEN = os.getenv('HH_ACCESS_TOKEN')
 HH_REFRESH_TOKEN = os.getenv('HH_REFRESH_TOKEN')
 HH_RESUME_ID = os.getenv('HH_RESUME_ID')  # ID резюме для откликов
+HH_API_BASE = os.getenv('HH_API_BASE', 'https://api.hh.ru')
 
 # GitHub settings
 GITHUB_REPO = os.getenv('GITHUB_REPO', 'https://github.com/nik45114/hh_bot.git')
 
-# Search settings
+# Search settings (defaults - могут быть переопределены пользователем)
 SEARCH_KEYWORDS = os.getenv('SEARCH_KEYWORDS', 'менеджер,руководитель').split(',')
 SEARCH_KEYWORDS = [kw.strip() for kw in SEARCH_KEYWORDS]
 SEARCH_INTERVAL_MINUTES = int(os.getenv('SEARCH_INTERVAL_MINUTES', '60'))
@@ -40,3 +41,4 @@ MIN_SALARY = int(os.getenv('MIN_SALARY', '0'))
 # Bot state file
 STATE_FILE = 'bot_state.json'
 APPLICATIONS_LOG = 'applications.log'
+DATABASE_FILE = 'bot.db'
