@@ -117,8 +117,12 @@ class Database:
                     (chat_id,)
                 )
                 logger.info(f"Created new user: {chat_id}")
+                
+                # Fetch the newly created user
+                cursor.execute('SELECT * FROM users WHERE chat_id = ?', (chat_id,))
+                user = cursor.fetchone()
             
-            return self.get_user(chat_id)
+            return dict(user) if user else None
     
     def get_user(self, chat_id: int) -> Optional[Dict]:
         """Get user by chat_id"""
