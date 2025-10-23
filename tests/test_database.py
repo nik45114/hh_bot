@@ -48,7 +48,8 @@ class TestDatabase(unittest.TestCase):
             12345,
             role_domain='Management',
             remote_only=True,
-            keywords=['Python', 'Django']
+            keywords=['Python', 'Django'],
+            roles=['Team Lead', 'Project Manager']
         )
         
         # Verify updates
@@ -56,6 +57,21 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(prefs['role_domain'], 'Management')
         self.assertEqual(prefs['remote_only'], True)
         self.assertEqual(prefs['keywords'], ['Python', 'Django'])
+        self.assertEqual(prefs['roles'], ['Team Lead', 'Project Manager'])
+    
+    def test_roles_serialization(self):
+        """Test that roles are properly serialized/deserialized"""
+        self.db.get_or_create_user(12345, 'testuser')
+        
+        # Set multiple roles
+        test_roles = ['Руководитель', 'Project Manager', 'Team Lead']
+        self.db.update_preferences(12345, roles=test_roles)
+        
+        # Retrieve and verify
+        prefs = self.db.get_preferences(12345)
+        self.assertEqual(prefs['roles'], test_roles)
+        self.assertIsInstance(prefs['roles'], list)
+        self.assertEqual(len(prefs['roles']), 3)
     
     def test_vacancy_deduplication(self):
         """Test vacancy sent/processed tracking"""

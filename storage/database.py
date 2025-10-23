@@ -56,6 +56,7 @@ class Database:
                     area_id INTEGER DEFAULT 1,
                     keywords TEXT,
                     role_level TEXT,
+                    roles TEXT,
                     salary_min INTEGER DEFAULT 0,
                     schedule TEXT DEFAULT 'remote',
                     employment TEXT DEFAULT 'full',
@@ -66,6 +67,13 @@ class Database:
                     FOREIGN KEY (chat_id) REFERENCES users(chat_id)
                 )
             ''')
+            
+            # Add roles column if it doesn't exist (migration)
+            try:
+                cursor.execute('SELECT roles FROM preferences LIMIT 1')
+            except sqlite3.OperationalError:
+                logger.info("Adding roles column to preferences table")
+                cursor.execute('ALTER TABLE preferences ADD COLUMN roles TEXT')
             
             # Applications log table
             cursor.execute('''
@@ -170,6 +178,16 @@ class Database:
                         result['keywords'] = []
                 else:
                     result['keywords'] = []
+                
+                # Parse roles field
+                if result.get('roles'):
+                    try:
+                        result['roles'] = json.loads(result['roles'])
+                    except:
+                        result['roles'] = []
+                else:
+                    result['roles'] = []
+                
                 return result
             
             # Return defaults if not found
@@ -181,6 +199,7 @@ class Database:
                 'area_id': 1,
                 'keywords': [],
                 'role_level': None,
+                'roles': [],
                 'salary_min': 0,
                 'schedule': 'remote',
                 'employment': 'full',
@@ -197,6 +216,10 @@ class Database:
             # Convert keywords list to JSON if present
             if 'keywords' in kwargs and isinstance(kwargs['keywords'], list):
                 kwargs['keywords'] = json.dumps(kwargs['keywords'], ensure_ascii=False)
+            
+            # Convert roles list to JSON if present
+            if 'roles' in kwargs and isinstance(kwargs['roles'], list):
+                kwargs['roles'] = json.dumps(kwargs['roles'], ensure_ascii=False)
             
             # Build update query
             fields = ', '.join([f"{key} = ?" for key in kwargs.keys()])
