@@ -16,6 +16,9 @@ from telegram.ext import (
     filters,
     ConversationHandler
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import git
 
 import config
 from hh_client import HeadHunterClient, format_vacancy_info
@@ -85,6 +88,157 @@ class JobBot:
         
         # Temporary storage for current vacancies per user
         self.current_vacancies = {}
+        
+        # Scheduler for 24/7 monitoring
+        self.scheduler = AsyncIOScheduler()
+        self.app = None  # Will be set when bot starts
+        
+        # Rate limiting
+        self.last_hh_request = datetime.now() - timedelta(seconds=10)
+    
+    def set_application(self, app):
+        """Set telegram application reference"""
+        self.app = app
+    
+    def start_monitoring(self):
+        """Start the monitoring scheduler"""
+        if not self.scheduler.running:
+            # Add job to check for new vacancies
+            self.scheduler.add_job(
+                self.check_all_users_vacancies,
+                trigger=IntervalTrigger(seconds=config.HH_SEARCH_INTERVAL_SEC),
+                id='vacancy_monitoring',
+                replace_existing=True
+            )
+            self.scheduler.start()
+            logger.info(f"Monitoring scheduler started with interval {config.HH_SEARCH_INTERVAL_SEC}s")
+    
+    async def check_all_users_vacancies(self):
+        """Check for new vacancies for all users with monitoring enabled"""
+        try:
+            monitoring_users = self.db.get_all_monitoring_users()
+            logger.info(f"Checking vacancies for {len(monitoring_users)} users with monitoring enabled")
+            
+            for chat_id in monitoring_users:
+                try:
+                    await self.check_user_vacancies(chat_id)
+                    await asyncio.sleep(2)  # Small delay between users
+                except Exception as e:
+                    logger.error(f"Error checking vacancies for user {chat_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error in check_all_users_vacancies: {e}")
+    
+    async def check_user_vacancies(self, chat_id: int):
+        """Check for new vacancies for a specific user"""
+        try:
+            prefs = self.db.get_preferences(chat_id)
+            
+            # Build search parameters
+            keywords = prefs.get('keywords', [])
+            search_text = ' '.join(keywords) if keywords else prefs.get('role_level', '')
+            
+            if not search_text and prefs.get('role_domain') == 'Management':
+                search_text = 'руководитель менеджер'
+            elif not search_text:
+                search_text = 'python developer'
+            
+            # Rate limiting
+            await self._wait_for_rate_limit()
+            
+            # Search vacancies
+            vacancies = self.hh_client.search_vacancies(
+                text=search_text,
+                area=prefs.get('area_id', 1),
+                schedule=prefs.get('schedule', 'remote') if prefs.get('remote_only') else None,
+                experience=prefs.get('experience', 'between3And6'),
+                employment=prefs.get('employment', 'full'),
+                salary=prefs.get('salary_min', 0) if prefs.get('salary_min') > 0 else None,
+                per_page=10
+            )
+            
+            if not vacancies:
+                return
+            
+            # Filter to only new vacancies
+            new_vacancies = [v for v in vacancies if not self.db.is_vacancy_sent(chat_id, v['id'])]
+            
+            if not new_vacancies:
+                return
+            
+            logger.info(f"Found {len(new_vacancies)} new vacancies for user {chat_id}")
+            
+            # Update last check time
+            self.db.update_monitoring_state(chat_id, last_check=datetime.now())
+            
+            # Send vacancies to user
+            for vacancy in new_vacancies:
+                await self.send_monitored_vacancy(chat_id, vacancy)
+                self.db.mark_vacancy_sent(chat_id, vacancy['id'])
+                await asyncio.sleep(1)  # Delay between messages
+                
+        except Exception as e:
+            logger.error(f"Error checking vacancies for user {chat_id}: {e}")
+    
+    async def send_monitored_vacancy(self, chat_id: int, vacancy: Dict):
+        """Send a monitored vacancy to the user"""
+        try:
+            if not self.app:
+                logger.error("App not initialized, cannot send message")
+                return
+            
+            vacancy_text = format_vacancy_info(vacancy)
+            prefs = self.db.get_preferences(chat_id)
+            auto_apply = prefs.get('auto_apply', False)
+            
+            header = "🔔 <b>Новая вакансия найдена!</b>\n\n"
+            
+            if auto_apply:
+                # Auto-apply mode
+                result = await self.apply_to_vacancy(chat_id, vacancy)
+                status_icon = "✅" if result.get('success') else "❌"
+                message = (
+                    f"{header}{vacancy_text}\n\n"
+                    f"{status_icon} <b>Авто-отклик:</b> {result.get('message')}"
+                )
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode='HTML'
+                )
+            else:
+                # Manual mode - show buttons
+                vacancy_id = vacancy['id']
+                keyboard = [
+                    [InlineKeyboardButton("✅ Откликнуться", callback_data=f"{VACANCY_PREFIX}apply_{vacancy_id}")],
+                    [InlineKeyboardButton("❌ Пропустить", callback_data=f"{VACANCY_PREFIX}skip_{vacancy_id}")],
+                    [InlineKeyboardButton("🔗 Открыть на сайте", url=vacancy.get('alternate_url', ''))]
+                ]
+                
+                # Store vacancy for callback handling
+                if chat_id not in self.current_vacancies:
+                    self.current_vacancies[chat_id] = []
+                self.current_vacancies[chat_id].append(vacancy)
+                
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{header}{vacancy_text}",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='HTML'
+                )
+        except Exception as e:
+            logger.error(f"Error sending monitored vacancy to {chat_id}: {e}")
+    
+    async def _wait_for_rate_limit(self):
+        """Wait for rate limit if needed"""
+        elapsed = (datetime.now() - self.last_hh_request).total_seconds()
+        min_interval = 1.0 / config.HH_RATE_LIMIT_QPS
+        
+        if elapsed < min_interval:
+            wait_time = min_interval - elapsed
+            logger.debug(f"Rate limiting: waiting {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+        
+        self.last_hh_request = datetime.now()
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -102,16 +256,26 @@ class JobBot:
         """Показать главное меню"""
         chat_id = message.chat_id if hasattr(message, 'chat_id') else message.chat.id
         prefs = self.db.get_preferences(chat_id)
+        monitoring_state = self.db.get_monitoring_state(chat_id)
+        
         auto_apply_status = "✅ Вкл" if prefs.get('auto_apply') else "❌ Выкл"
+        monitoring_status = "✅ Вкл" if monitoring_state.get('monitoring_enabled') else "❌ Выкл"
         
         keyboard = [
             [InlineKeyboardButton("🔍 Поиск вакансий", callback_data='main_search')],
             [InlineKeyboardButton("⚙️ Настроить критерии", callback_data='main_criteria')],
             [InlineKeyboardButton("✍️ Промпт сопровода", callback_data='main_prompt')],
             [InlineKeyboardButton(f"🤖 Авто-отклик: {auto_apply_status}", callback_data='main_autoapply')],
+            [InlineKeyboardButton(f"📡 Мониторинг 24/7: {monitoring_status}", callback_data='main_monitoring')],
             [InlineKeyboardButton("📊 Статистика", callback_data='main_stats')],
             [InlineKeyboardButton("ℹ️ Помощь", callback_data='main_help')]
         ]
+        
+        # Add admin commands if user is admin
+        user_id = chat_id
+        if user_id in config.ADMIN_CHAT_IDS:
+            keyboard.append([InlineKeyboardButton("⚙️ Админ", callback_data='main_admin')])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         welcome_text = """
@@ -121,6 +285,7 @@ class JobBot:
 ✅ Поиск вакансий по критериям (IT/Управление, удалёнка)
 ✅ Генерация сопроводительных писем с AI  
 ✅ Автоматические отклики на вакансии
+✅ 24/7 мониторинг новых вакансий
 ✅ Гибкая настройка критериев поиска
 ✅ Управление промтами для сопровода
 
@@ -153,10 +318,14 @@ class JobBot:
             await self.handle_prompt_menu(query)
         elif action == 'main_autoapply':
             await self.toggle_auto_apply(query)
+        elif action == 'main_monitoring':
+            await self.toggle_monitoring(query)
         elif action == 'main_stats':
             await self.show_stats(query)
         elif action == 'main_help':
             await self.show_help(query)
+        elif action == 'main_admin':
+            await self.show_admin_menu(query)
         elif action == 'back_to_menu':
             await self.show_main_menu(query.message, edit=True)
         
@@ -171,6 +340,10 @@ class JobBot:
         # Prompt actions
         elif action.startswith('prompt_'):
             await self.handle_prompt_action(query, action, context)
+        
+        # Admin actions
+        elif action.startswith('admin_'):
+            await self.handle_admin_action(query, action, context)
         
         # Vacancy actions
         elif action.startswith(VACANCY_PREFIX):
@@ -628,10 +801,165 @@ class JobBot:
         await query.answer(f"Авто-отклик {status}")
         await self.show_main_menu(query.message, edit=True)
     
+    async def toggle_monitoring(self, query):
+        """Переключить режим мониторинга 24/7"""
+        chat_id = query.message.chat_id
+        monitoring_state = self.db.get_monitoring_state(chat_id)
+        
+        new_value = not monitoring_state.get('monitoring_enabled', False)
+        self.db.update_monitoring_state(chat_id, enabled=new_value)
+        
+        status = "включён" if new_value else "выключен"
+        
+        if new_value:
+            message = f"✅ Мониторинг 24/7 {status}\n\nБот будет проверять новые вакансии каждые {config.HH_SEARCH_INTERVAL_SEC} секунд и автоматически присылать их вам."
+        else:
+            message = f"❌ Мониторинг 24/7 {status}"
+        
+        await query.answer(message)
+        await self.show_main_menu(query.message, edit=True)
+    
+    async def show_admin_menu(self, query):
+        """Показать меню администратора"""
+        user_id = query.from_user.id
+        if user_id not in config.ADMIN_CHAT_IDS:
+            await query.answer("❌ Недостаточно прав")
+            return
+        
+        admin_text = """
+🔐 <b>Админ-панель</b>
+
+<b>Доступные команды:</b>
+• Обновление кода из Git
+• Перезапуск сервиса (если разрешено)
+• Просмотр статуса системы
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить код", callback_data='admin_update_code')],
+        ]
+        
+        if config.ALLOW_SYSTEMCTL:
+            keyboard.append([InlineKeyboardButton("🔁 Перезапустить сервис", callback_data='admin_restart')])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')])
+        
+        await query.edit_message_text(
+            admin_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    
+    async def handle_admin_action(self, query, action, context):
+        """Обработка админских действий"""
+        user_id = query.from_user.id
+        if user_id not in config.ADMIN_CHAT_IDS:
+            await query.answer("❌ Недостаточно прав")
+            return
+        
+        if action == 'admin_update_code':
+            await query.edit_message_text("⏳ Обновляю код из репозитория...")
+            result = await self.update_code_from_git()
+            await query.edit_message_text(
+                f"<b>Обновление кода:</b>\n\n{result}",
+                parse_mode='HTML'
+            )
+        
+        elif action == 'admin_restart':
+            if not config.ALLOW_SYSTEMCTL:
+                await query.answer("❌ Перезапуск сервиса отключён в конфигурации")
+                return
+            
+            await query.edit_message_text("⏳ Перезапускаю сервис...")
+            result = await self.restart_service()
+            await query.edit_message_text(
+                f"<b>Перезапуск сервиса:</b>\n\n{result}",
+                parse_mode='HTML'
+            )
+    
+    async def update_code_from_git(self) -> str:
+        """Обновить код из Git репозитория"""
+        try:
+            repo_path = config.BOT_INSTALL_PATH
+            
+            if not os.path.exists(os.path.join(repo_path, '.git')):
+                return f"❌ Директория {repo_path} не является Git репозиторием"
+            
+            repo = git.Repo(repo_path)
+            
+            # Fetch changes
+            origin = repo.remotes.origin
+            fetch_info = origin.fetch()
+            
+            # Check for conflicts
+            if repo.is_dirty():
+                return "⚠️ Обнаружены локальные изменения.\n\nВыполните git stash или commit вручную."
+            
+            # Pull changes
+            current_commit = repo.head.commit.hexsha[:7]
+            pull_info = origin.pull('main')
+            new_commit = repo.head.commit.hexsha[:7]
+            
+            if current_commit == new_commit:
+                return f"✅ Код уже актуален\n\nТекущий коммит: {current_commit}"
+            
+            return f"✅ Код успешно обновлён\n\nБыло: {current_commit}\nСтало: {new_commit}\n\nРекомендуется перезапустить сервис."
+            
+        except git.exc.GitCommandError as e:
+            logger.error(f"Git error during update: {e}")
+            return f"❌ Ошибка Git:\n\n{str(e)}"
+        except Exception as e:
+            logger.error(f"Error updating code: {e}")
+            return f"❌ Ошибка обновления:\n\n{str(e)}"
+    
+    async def restart_service(self) -> str:
+        """Перезапустить systemd сервис"""
+        try:
+            if not config.ALLOW_SYSTEMCTL:
+                return "❌ Перезапуск сервиса отключён в конфигурации"
+            
+            # Run systemctl restart command
+            result = subprocess.run(
+                ['sudo', 'systemctl', 'restart', config.SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                # Check status
+                status_result = subprocess.run(
+                    ['sudo', 'systemctl', 'status', config.SERVICE_NAME],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                return f"✅ Сервис {config.SERVICE_NAME} перезапущен\n\n<code>{status_result.stdout[:500]}</code>"
+            else:
+                return f"❌ Ошибка перезапуска:\n\n<code>{result.stderr[:500]}</code>"
+                
+        except subprocess.TimeoutExpired:
+            return "⏳ Команда перезапуска выполняется слишком долго"
+        except Exception as e:
+            logger.error(f"Error restarting service: {e}")
+            return f"❌ Ошибка:\n\n{str(e)}"
+    
     async def show_help(self, query):
         """Показать справку"""
-        help_text = """
+        chat_id = query.message.chat_id
+        prefs = self.db.get_preferences(chat_id)
+        monitoring_state = self.db.get_monitoring_state(chat_id)
+        
+        auto_apply_status = "✅ Включён" if prefs.get('auto_apply') else "❌ Выключен"
+        monitoring_status = "✅ Включён" if monitoring_state.get('monitoring_enabled') else "❌ Выключен"
+        
+        help_text = f"""
 ℹ️ <b>Справка</b>
+
+<b>Текущий статус:</b>
+• Авто-отклик: {auto_apply_status}
+• Мониторинг 24/7: {monitoring_status}
 
 <b>Команды бота:</b>
 /start - Главное меню
@@ -640,15 +968,21 @@ class JobBot:
 /prompt - Управление промптом
 /apply_on - Включить авто-отклик
 /apply_off - Выключить авто-отклик
+/monitoring_on - Включить мониторинг 24/7
+/monitoring_off - Выключить мониторинг 24/7
 /stats - Статистика откликов
 /help - Эта справка
+
+<b>Админские команды (если вы админ):</b>
+/update_code - Обновить код из Git
+/restart - Перезапустить сервис (если разрешено)
 
 <b>Как работает бот:</b>
 1️⃣ Настройте критерии поиска (сфера, город, удалёнка, зарплата)
 2️⃣ При необходимости настройте промпт для сопроводительных писем
-3️⃣ Запустите поиск вакансий
-4️⃣ Бот найдёт вакансии и предложит откликнуться
-5️⃣ В режиме авто-отклика бот откликается автоматически
+3️⃣ Включите мониторинг 24/7 для автоматической проверки новых вакансий
+4️⃣ Включите авто-отклик, если хотите откликаться автоматически
+5️⃣ Или запустите поиск вручную командой /search
 
 <b>⚙️ Настройка HH.ru API:</b>
 
@@ -673,6 +1007,8 @@ class JobBot:
 • OPENAI_API_KEY - ключ OpenAI для генерации писем
 • HH_ACCESS_TOKEN - токен доступа к HH API
 • HH_RESUME_ID - ID резюме
+• HH_SEARCH_INTERVAL_SEC - интервал проверки (сек)
+• ADMIN_CHAT_IDS - ID админов (через запятую)
 
 Пример: см. файл .env.example
 """
@@ -747,6 +1083,47 @@ class JobBot:
         })()
         await self.show_help(query.callback_query)
     
+    async def monitoring_on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /monitoring_on"""
+        chat_id = update.effective_user.id
+        self.db.update_monitoring_state(chat_id, enabled=True)
+        await update.message.reply_text(
+            f"✅ Мониторинг 24/7 включён\n\n"
+            f"Бот будет проверять новые вакансии каждые {config.HH_SEARCH_INTERVAL_SEC} секунд."
+        )
+    
+    async def monitoring_off_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /monitoring_off"""
+        chat_id = update.effective_user.id
+        self.db.update_monitoring_state(chat_id, enabled=False)
+        await update.message.reply_text("❌ Мониторинг 24/7 выключен")
+    
+    async def update_code_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /update_code"""
+        user_id = update.effective_user.id
+        if user_id not in config.ADMIN_CHAT_IDS:
+            await update.message.reply_text("❌ Недостаточно прав для выполнения этой команды")
+            return
+        
+        await update.message.reply_text("⏳ Обновляю код из репозитория...")
+        result = await self.update_code_from_git()
+        await update.message.reply_text(f"<b>Обновление кода:</b>\n\n{result}", parse_mode='HTML')
+    
+    async def restart_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /restart"""
+        user_id = update.effective_user.id
+        if user_id not in config.ADMIN_CHAT_IDS:
+            await update.message.reply_text("❌ Недостаточно прав для выполнения этой команды")
+            return
+        
+        if not config.ALLOW_SYSTEMCTL:
+            await update.message.reply_text("❌ Перезапуск сервиса отключён в конфигурации")
+            return
+        
+        await update.message.reply_text("⏳ Перезапускаю сервис...")
+        result = await self.restart_service()
+        await update.message.reply_text(f"<b>Перезапуск сервиса:</b>\n\n{result}", parse_mode='HTML')
+    
     # === TEXT MESSAGE HANDLERS ===
     
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -813,6 +1190,9 @@ def main():
     # Создаем приложение Telegram
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     
+    # Set application reference in job_bot
+    job_bot.set_application(application)
+    
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", job_bot.start_command))
     application.add_handler(CommandHandler("criteria", job_bot.criteria_command))
@@ -820,15 +1200,24 @@ def main():
     application.add_handler(CommandHandler("prompt", job_bot.prompt_command))
     application.add_handler(CommandHandler("apply_on", job_bot.apply_on_command))
     application.add_handler(CommandHandler("apply_off", job_bot.apply_off_command))
+    application.add_handler(CommandHandler("monitoring_on", job_bot.monitoring_on_command))
+    application.add_handler(CommandHandler("monitoring_off", job_bot.monitoring_off_command))
     application.add_handler(CommandHandler("stats", job_bot.stats_command))
     application.add_handler(CommandHandler("help", job_bot.help_command))
     application.add_handler(CommandHandler("cancel", job_bot.cancel_command))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("update_code", job_bot.update_code_command))
+    application.add_handler(CommandHandler("restart", job_bot.restart_command))
     
     # Обработчик кнопок
     application.add_handler(CallbackQueryHandler(job_bot.button_callback))
     
     # Обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, job_bot.handle_text_message))
+    
+    # Start monitoring scheduler
+    job_bot.start_monitoring()
     
     # Запускаем бота
     logger.info("Бот запущен!")
