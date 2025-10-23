@@ -330,7 +330,7 @@ class JobBot:
             await self.show_main_menu(query.message, edit=True)
         
         # Criteria actions
-        elif action.startswith('criteria_'):
+        elif action.startswith('criteria_') or action.startswith('set_domain_') or action.startswith('set_level_') or action.startswith('set_city_'):
             await self.handle_criteria_action(query, action, context)
         
         # Search actions
