@@ -1,7 +1,8 @@
 from openai import OpenAI
 import logging
 from typing import Optional
-from resume_data import RESUME_DATA, COVER_LETTER_PROMPT_TEMPLATE
+from resume_data import RESUME_DATA
+from prompts import get_default_prompt, format_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,11 @@ class CoverLetterGenerator:
     def generate_cover_letter(self,
                             job_title: str,
                             company_name: str,
-                            job_description: str) -> Optional[str]:
+                            job_description: str,
+                            custom_prompt: str = None,
+                            role_domain: str = 'IT',
+                            schedule: str = None,
+                            location: str = None) -> Optional[str]:
         """
         Генерация сопроводительного письма
         
@@ -23,21 +28,39 @@ class CoverLetterGenerator:
             job_title: Название вакансии
             company_name: Название компании
             job_description: Описание вакансии
+            custom_prompt: Пользовательский промпт (если None - используется дефолтный)
+            role_domain: Область ('IT', 'Management', etc.)
+            schedule: График работы (для учета в промпте)
+            location: Локация (для учета в промпте)
             
         Returns:
             Сопроводительное письмо или None в случае ошибки
         """
         try:
-            # Формируем промпт
-            prompt = COVER_LETTER_PROMPT_TEMPLATE.format(
-                job_title=job_title,
-                company_name=company_name,
-                name=RESUME_DATA['name'],
-                position=RESUME_DATA['position'],
-                summary=RESUME_DATA['summary'],
-                skills=', '.join(RESUME_DATA['skills']),
-                job_description=job_description[:1000]  # Ограничиваем длину
-            )
+            # Выбираем промпт
+            if custom_prompt:
+                prompt_template = custom_prompt
+            else:
+                prompt_template = get_default_prompt(role_domain)
+            
+            # Подготовка данных
+            vacancy_data = {
+                'title': job_title,
+                'company': company_name,
+                'description': job_description,
+                'schedule': schedule,
+                'location': location
+            }
+            
+            user_data = {
+                'name': RESUME_DATA['name'],
+                'position': RESUME_DATA['position'],
+                'summary': RESUME_DATA['summary'],
+                'skills': RESUME_DATA['skills']
+            }
+            
+            # Форматируем промпт
+            prompt = format_prompt(prompt_template, vacancy_data, user_data)
             
             # Генерируем письмо
             response = self.client.chat.completions.create(
@@ -45,7 +68,7 @@ class CoverLetterGenerator:
                 messages=[
                     {
                         "role": "system",
-                        "content": "Ты профессиональный HR-консультант, который помогает создавать эффективные сопроводительные письма для IT-специалистов."
+                        "content": "Ты профессиональный HR-консультант, который помогает создавать эффективные сопроводительные письма для специалистов разных областей."
                     },
                     {
                         "role": "user",
