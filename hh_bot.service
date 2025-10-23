@@ -1,0 +1,20 @@
+[Unit]
+Description=HH Job Bot - Telegram bot for job applications automation
+After=network.target
+
+[Service]
+Type=simple
+User=your_username
+Group=your_username
+WorkingDirectory=/home/your_username/hh_bot
+Environment="PATH=/home/your_username/hh_bot/venv/bin"
+ExecStart=/home/your_username/hh_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+# Логирование
+StandardOutput=append:/home/your_username/hh_bot/bot.log
+StandardError=append:/home/your_username/hh_bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
