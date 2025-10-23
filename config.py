@@ -42,3 +42,16 @@ MIN_SALARY = int(os.getenv('MIN_SALARY', '0'))
 STATE_FILE = 'bot_state.json'
 APPLICATIONS_LOG = 'applications.log'
 DATABASE_FILE = 'bot.db'
+
+# Admin settings
+ADMIN_CHAT_IDS = os.getenv('ADMIN_CHAT_IDS', '').split(',')
+ADMIN_CHAT_IDS = [int(x.strip()) for x in ADMIN_CHAT_IDS if x.strip().isdigit()]
+
+# Monitoring settings
+HH_SEARCH_INTERVAL_SEC = int(os.getenv('HH_SEARCH_INTERVAL_SEC', '180'))  # Default: 3 minutes
+ALLOW_SYSTEMCTL = os.getenv('ALLOW_SYSTEMCTL', 'false').lower() == 'true'
+SERVICE_NAME = os.getenv('SERVICE_NAME', 'hh_bot')
+BOT_INSTALL_PATH = os.getenv('BOT_INSTALL_PATH', '/opt/hh_bot')
+
+# Rate limiting
+HH_RATE_LIMIT_QPS = float(os.getenv('HH_RATE_LIMIT_QPS', '0.5'))  # 0.5 requests per second

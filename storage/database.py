@@ -94,6 +94,27 @@ class Database:
                 )
             ''')
             
+            # Sent vacancies table (for 24/7 monitoring)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sent_vacancies (
+                    chat_id INTEGER,
+                    vacancy_id TEXT,
+                    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, vacancy_id),
+                    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+                )
+            ''')
+            
+            # Monitoring state table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS monitoring_state (
+                    chat_id INTEGER PRIMARY KEY,
+                    monitoring_enabled BOOLEAN DEFAULT 0,
+                    last_check TIMESTAMP,
+                    FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+                )
+            ''')
+            
             logger.info("Database initialized successfully")
     
     def get_or_create_user(self, chat_id: int, username: str = None) -> Dict:
@@ -252,3 +273,69 @@ class Database:
             ''', (chat_id, limit))
             
             return [dict(row) for row in cursor.fetchall()]
+    
+    def mark_vacancy_sent(self, chat_id: int, vacancy_id: str):
+        """Mark vacancy as sent to user"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT OR IGNORE INTO sent_vacancies (chat_id, vacancy_id) VALUES (?, ?)',
+                (chat_id, vacancy_id)
+            )
+    
+    def is_vacancy_sent(self, chat_id: int, vacancy_id: str) -> bool:
+        """Check if vacancy was already sent to user"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT 1 FROM sent_vacancies WHERE chat_id = ? AND vacancy_id = ?',
+                (chat_id, vacancy_id)
+            )
+            return cursor.fetchone() is not None
+    
+    def get_monitoring_state(self, chat_id: int) -> Dict:
+        """Get monitoring state for user"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM monitoring_state WHERE chat_id = ?', (chat_id,))
+            state = cursor.fetchone()
+            
+            if state:
+                return dict(state)
+            
+            # Create default state
+            cursor.execute(
+                'INSERT INTO monitoring_state (chat_id, monitoring_enabled) VALUES (?, ?)',
+                (chat_id, False)
+            )
+            return {'chat_id': chat_id, 'monitoring_enabled': False, 'last_check': None}
+    
+    def update_monitoring_state(self, chat_id: int, enabled: bool = None, last_check: datetime = None):
+        """Update monitoring state"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            updates = []
+            values = []
+            
+            if enabled is not None:
+                updates.append('monitoring_enabled = ?')
+                values.append(enabled)
+            
+            if last_check is not None:
+                updates.append('last_check = ?')
+                values.append(last_check)
+            
+            if updates:
+                values.append(chat_id)
+                cursor.execute(
+                    f'UPDATE monitoring_state SET {", ".join(updates)} WHERE chat_id = ?',
+                    values
+                )
+    
+    def get_all_monitoring_users(self) -> List[int]:
+        """Get list of all users with monitoring enabled"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT chat_id FROM monitoring_state WHERE monitoring_enabled = 1')
+            return [row[0] for row in cursor.fetchall()]
