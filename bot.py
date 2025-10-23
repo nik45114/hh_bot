@@ -78,7 +78,9 @@ class JobBot:
         self.hh_client = HeadHunterClient(
             config.HH_EMAIL, 
             config.HH_PASSWORD,
-            config.HH_ACCESS_TOKEN
+            config.HH_ACCESS_TOKEN,
+            config.HH_REFRESH_TOKEN,
+            config.HH_USER_AGENT
         )
         self.cover_letter_gen = CoverLetterGenerator(config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
         self.db = Database(config.DATABASE_FILE)
@@ -358,6 +360,10 @@ class JobBot:
         domain_emoji = "💼" if prefs.get('role_domain') == 'Management' else "💻"
         remote_emoji = "✅" if prefs.get('remote_only') else "❌"
         
+        # Format roles display
+        roles = prefs.get('roles', [])
+        roles_display = ', '.join(roles) if roles else 'не заданы'
+        
         criteria_text = f"""
 ⚙️ <b>Настройки критериев поиска</b>
 
@@ -366,7 +372,7 @@ class JobBot:
 🏠 <b>Только удалёнка:</b> {remote_emoji}
 📝 <b>Ключевые слова:</b> {', '.join(prefs.get('keywords', [])) or 'не заданы'}
 💰 <b>Зарплата от:</b> {prefs.get('salary_min', 0)} руб.
-👔 <b>Уровень:</b> {prefs.get('role_level') or 'не задан'}
+👔 <b>Роли:</b> {roles_display}
 """
         
         keyboard = [
@@ -387,16 +393,29 @@ class JobBot:
         chat_id = query.message.chat_id
         
         if action == 'criteria_domain':
+            prefs = self.db.get_preferences(chat_id)
+            current_domain = prefs.get('role_domain', 'IT')
+            
             keyboard = [
-                [InlineKeyboardButton("💻 IT", callback_data='set_domain_IT')],
-                [InlineKeyboardButton("💼 Управление", callback_data='set_domain_Management')],
-                [InlineKeyboardButton("🔧 Другое", callback_data='set_domain_Other')],
+                [InlineKeyboardButton(
+                    f"{'✅ ' if current_domain == 'IT' else '⬜️ '}💻 IT", 
+                    callback_data='set_domain_IT'
+                )],
+                [InlineKeyboardButton(
+                    f"{'✅ ' if current_domain == 'Management' else '⬜️ '}💼 Управление", 
+                    callback_data='set_domain_Management'
+                )],
+                [InlineKeyboardButton(
+                    f"{'✅ ' if current_domain == 'Other' else '⬜️ '}🔧 Другое", 
+                    callback_data='set_domain_Other'
+                )],
                 [InlineKeyboardButton("🔙 Назад", callback_data='main_criteria')]
             ]
             await query.edit_message_text(
                 "Выберите сферу деятельности:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            await query.answer()
         
         elif action.startswith('set_domain_'):
             domain = action.replace('set_domain_', '')
@@ -422,6 +441,7 @@ class JobBot:
                 "Выберите город:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            await query.answer()
         
         elif action.startswith('set_city_'):
             parts = action.replace('set_city_', '').split('_', 1)
@@ -432,21 +452,56 @@ class JobBot:
             await self.handle_criteria_menu(query)
         
         elif action == 'criteria_level':
+            prefs = self.db.get_preferences(chat_id)
+            current_roles = prefs.get('roles', [])
+            
             keyboard = []
             for level in ROLE_LEVELS:
-                keyboard.append([InlineKeyboardButton(level, callback_data=f'set_level_{level}')])
+                is_selected = level in current_roles
+                checkbox = "✅" if is_selected else "⬜️"
+                keyboard.append([InlineKeyboardButton(
+                    f"{checkbox} {level}", 
+                    callback_data=f'toggle_role_{level}'
+                )])
+            keyboard.append([InlineKeyboardButton("💾 Сохранить", callback_data='main_criteria')])
             keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='main_criteria')])
             
             await query.edit_message_text(
-                "Выберите уровень/роль:",
+                "Выберите уровень/роль (можно выбрать несколько):",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            await query.answer()
         
-        elif action.startswith('set_level_'):
-            level = action.replace('set_level_', '')
-            self.db.update_preferences(chat_id, role_level=level)
-            await query.answer(f"Уровень изменён на: {level}")
-            await self.handle_criteria_menu(query)
+        elif action.startswith('toggle_role_'):
+            role = action.replace('toggle_role_', '')
+            prefs = self.db.get_preferences(chat_id)
+            current_roles = prefs.get('roles', [])
+            
+            # Toggle role selection
+            if role in current_roles:
+                current_roles.remove(role)
+            else:
+                current_roles.append(role)
+            
+            # Save to database
+            self.db.update_preferences(chat_id, roles=current_roles)
+            
+            # Update display with new checkboxes
+            keyboard = []
+            for level in ROLE_LEVELS:
+                is_selected = level in current_roles
+                checkbox = "✅" if is_selected else "⬜️"
+                keyboard.append([InlineKeyboardButton(
+                    f"{checkbox} {level}", 
+                    callback_data=f'toggle_role_{level}'
+                )])
+            keyboard.append([InlineKeyboardButton("💾 Сохранить", callback_data='main_criteria')])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='main_criteria')])
+            
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            await query.answer(f"{'Добавлено' if role in current_roles else 'Удалено'}: {role}")
         
         elif action == 'criteria_keywords':
             await query.edit_message_text(
@@ -455,6 +510,7 @@ class JobBot:
                 "или: Руководитель, Менеджер проектов\n\n"
                 "Для отмены отправьте /cancel"
             )
+            await query.answer()
             context.user_data['waiting_for'] = 'keywords'
             
         elif action == 'criteria_salary':
@@ -463,6 +519,7 @@ class JobBot:
                 "Например: 150000\n\n"
                 "Для отмены отправьте /cancel"
             )
+            await query.answer()
             context.user_data['waiting_for'] = 'salary'
     
     # === PROMPT MANAGEMENT ===
@@ -1025,14 +1082,38 @@ class JobBot:
     
     async def criteria_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /criteria"""
-        query = Update(update_id=0, callback_query=update.callback_query)
-        query.callback_query = type('obj', (object,), {
-            'message': update.message,
-            'from_user': update.effective_user,
-            'answer': lambda: asyncio.sleep(0),
-            'edit_message_text': update.message.edit_text if hasattr(update.message, 'edit_text') else update.message.reply_text
-        })()
-        await self.handle_criteria_menu(query.callback_query)
+        prefs = self.db.get_preferences(update.effective_user.id)
+        
+        domain_emoji = "💼" if prefs.get('role_domain') == 'Management' else "💻"
+        remote_emoji = "✅" if prefs.get('remote_only') else "❌"
+        
+        # Format roles display
+        roles = prefs.get('roles', [])
+        roles_display = ', '.join(roles) if roles else 'не заданы'
+        
+        criteria_text = f"""
+⚙️ <b>Настройки критериев поиска</b>
+
+{domain_emoji} <b>Сфера:</b> {prefs.get('role_domain', 'IT')}
+🌍 <b>Город:</b> {prefs.get('city', 'Москва')}
+🏠 <b>Только удалёнка:</b> {remote_emoji}
+📝 <b>Ключевые слова:</b> {', '.join(prefs.get('keywords', [])) or 'не заданы'}
+💰 <b>Зарплата от:</b> {prefs.get('salary_min', 0)} руб.
+👔 <b>Роли:</b> {roles_display}
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("💼/💻 Изменить сферу", callback_data='criteria_domain')],
+            [InlineKeyboardButton("🌍 Изменить город", callback_data='criteria_city')],
+            [InlineKeyboardButton("🏠 Только удалёнка вкл/выкл", callback_data='criteria_remote')],
+            [InlineKeyboardButton("📝 Ключевые слова", callback_data='criteria_keywords')],
+            [InlineKeyboardButton("💰 Минимальная зарплата", callback_data='criteria_salary')],
+            [InlineKeyboardButton("👔 Уровень/роль", callback_data='criteria_level')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(criteria_text, reply_markup=reply_markup, parse_mode='HTML')
     
     async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /search"""
@@ -1042,14 +1123,35 @@ class JobBot:
     
     async def prompt_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /prompt"""
-        query = Update(update_id=0, callback_query=update.callback_query)
-        query.callback_query = type('obj', (object,), {
-            'message': update.message,
-            'from_user': update.effective_user,
-            'answer': lambda: asyncio.sleep(0),
-            'edit_message_text': update.message.edit_text if hasattr(update.message, 'edit_text') else update.message.reply_text
-        })()
-        await self.handle_prompt_menu(query.callback_query)
+        prefs = self.db.get_preferences(update.effective_user.id)
+        custom_prompt = prefs.get('prompt')
+        default_prompt = get_default_prompt(prefs.get('role_domain', 'IT'))
+        
+        if custom_prompt:
+            prompt_preview = custom_prompt[:200] + "..." if len(custom_prompt) > 200 else custom_prompt
+            status = "✅ Используется пользовательский промпт"
+        else:
+            prompt_preview = default_prompt[:200] + "..." if len(default_prompt) > 200 else default_prompt
+            status = "📝 Используется стандартный промпт"
+        
+        text = f"""
+✍️ <b>Управление промптом</b>
+
+{status}
+
+<b>Текущий промпт:</b>
+<code>{prompt_preview}</code>
+
+Промпт используется для генерации сопроводительных писем с помощью AI.
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ Изменить промпт", callback_data='prompt_edit')],
+            [InlineKeyboardButton("🔄 Сбросить по умолчанию", callback_data='prompt_reset')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
+        ]
+        
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     
     async def apply_on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /apply_on"""
@@ -1063,25 +1165,107 @@ class JobBot:
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /stats"""
-        query = Update(update_id=0, callback_query=update.callback_query)
-        query.callback_query = type('obj', (object,), {
-            'message': update.message,
-            'from_user': update.effective_user,
-            'answer': lambda: asyncio.sleep(0),
-            'edit_message_text': update.message.edit_text if hasattr(update.message, 'edit_text') else update.message.reply_text
-        })()
-        await self.show_stats(query.callback_query)
+        chat_id = update.effective_user.id
+        
+        # Get today's applications
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_count = self.db.get_applications_count(chat_id, since=today)
+        total_count = self.db.get_applications_count(chat_id)
+        
+        # Get recent applications
+        recent = self.db.get_recent_applications(chat_id, limit=5)
+        
+        stats_text = f"""
+📊 <b>Статистика</b>
+
+📝 Откликов сегодня: {today_count}
+📈 Всего откликов: {total_count}
+
+<b>Последние отклики:</b>
+"""
+        
+        if recent:
+            for app in recent:
+                status_icon = "✅" if app['status'] == 'success' else "❌"
+                date = app['applied_at'][:10] if app['applied_at'] else "дата неизвестна"
+                stats_text += f"\n{status_icon} {app['vacancy_title']} - {date}"
+        else:
+            stats_text += "\nПока нет откликов"
+        
+        await update.message.reply_text(stats_text, parse_mode='HTML')
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
-        query = Update(update_id=0, callback_query=update.callback_query)
-        query.callback_query = type('obj', (object,), {
-            'message': update.message,
-            'from_user': update.effective_user,
-            'answer': lambda: asyncio.sleep(0),
-            'edit_message_text': update.message.edit_text if hasattr(update.message, 'edit_text') else update.message.reply_text
-        })()
-        await self.show_help(query.callback_query)
+        chat_id = update.effective_user.id
+        prefs = self.db.get_preferences(chat_id)
+        monitoring_state = self.db.get_monitoring_state(chat_id)
+        
+        auto_apply_status = "✅ Включён" if prefs.get('auto_apply') else "❌ Выключен"
+        monitoring_status = "✅ Включён" if monitoring_state.get('monitoring_enabled') else "❌ Выключен"
+        
+        help_text = f"""
+ℹ️ <b>Справка</b>
+
+<b>Текущий статус:</b>
+• Авто-отклик: {auto_apply_status}
+• Мониторинг 24/7: {monitoring_status}
+
+<b>Команды бота:</b>
+/start - Главное меню
+/criteria - Настроить критерии поиска
+/search - Запустить поиск вакансий
+/prompt - Управление промптом
+/apply_on - Включить авто-отклик
+/apply_off - Выключить авто-отклик
+/monitoring_on - Включить мониторинг 24/7
+/monitoring_off - Выключить мониторинг 24/7
+/stats - Статистика откликов
+/help - Эта справка
+
+<b>Админские команды (если вы админ):</b>
+/update_code - Обновить код из Git
+/restart - Перезапустить сервис (если разрешено)
+
+<b>Как работает бот:</b>
+1️⃣ Настройте критерии поиска (сфера, город, удалёнка, зарплата)
+2️⃣ При необходимости настройте промпт для сопроводительных писем
+3️⃣ Включите мониторинг 24/7 для автоматической проверки новых вакансий
+4️⃣ Включите авто-отклик, если хотите откликаться автоматически
+5️⃣ Или запустите поиск вручную командой /search
+
+<b>⚙️ Настройка HH.ru API:</b>
+
+Для автоматических откликов нужны:
+• HH_ACCESS_TOKEN - OAuth токен доступа
+• HH_RESUME_ID - ID вашего резюме
+• HH_USER_AGENT - User-Agent для API запросов
+
+<b>Как получить токен:</b>
+1. Зарегистрируйте приложение на https://dev.hh.ru/admin
+2. Получите Client ID и Client Secret
+3. Пройдите OAuth авторизацию
+4. Получите access_token и refresh_token
+
+<b>Как узнать ID резюме:</b>
+Через API запрос GET https://api.hh.ru/resumes/mine
+с заголовком Authorization: Bearer YOUR_TOKEN
+
+Подробнее: https://github.com/hhru/api
+
+<b>Переменные окружения (.env):</b>
+• TELEGRAM_BOT_TOKEN - токен Telegram бота
+• OPENAI_API_KEY - ключ OpenAI для генерации писем
+• HH_ACCESS_TOKEN - токен доступа к HH API
+• HH_REFRESH_TOKEN - refresh токен для обновления
+• HH_RESUME_ID - ID резюме
+• HH_USER_AGENT - User-Agent (формат: app/user (email))
+• HH_SEARCH_INTERVAL_SEC - интервал проверки (сек)
+• ADMIN_CHAT_IDS - ID админов (через запятую)
+
+Пример: см. файл .env.example
+"""
+        
+        await update.message.reply_text(help_text, parse_mode='HTML')
     
     async def monitoring_on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /monitoring_on"""

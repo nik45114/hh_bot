@@ -21,6 +21,7 @@ HH_ACCESS_TOKEN = os.getenv('HH_ACCESS_TOKEN')
 HH_REFRESH_TOKEN = os.getenv('HH_REFRESH_TOKEN')
 HH_RESUME_ID = os.getenv('HH_RESUME_ID')  # ID резюме для откликов
 HH_API_BASE = os.getenv('HH_API_BASE', 'https://api.hh.ru')
+HH_USER_AGENT = os.getenv('HH_USER_AGENT', 'hh_bot/nik45114 (contact@example.com)')
 
 # GitHub settings
 GITHUB_REPO = os.getenv('GITHUB_REPO', 'https://github.com/nik45114/hh_bot.git')
