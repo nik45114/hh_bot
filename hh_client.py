@@ -12,6 +12,8 @@ class HeadHunterClient:
     """Клиент для работы с API HeadHunter"""
     
     BASE_URL = "https://api.hh.ru"
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 2  # seconds
     
     def __init__(self, email: str = None, password: str = None, access_token: str = None):
         self.session = requests.Session()
@@ -27,6 +29,53 @@ class HeadHunterClient:
             self.session.headers.update({
                 'Authorization': f'Bearer {self.access_token}'
             })
+    
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        """Make HTTP request with exponential backoff retry"""
+        last_exception = None
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', self.RETRY_BACKOFF_BASE ** (attempt + 1)))
+                    logger.warning(f"Rate limited (429). Waiting {retry_after}s before retry {attempt + 1}/{self.MAX_RETRIES}")
+                    time.sleep(retry_after)
+                    continue
+                
+                # Handle server errors (5xx) with retry
+                if response.status_code >= 500:
+                    if attempt < self.MAX_RETRIES - 1:
+                        wait_time = self.RETRY_BACKOFF_BASE ** (attempt + 1)
+                        logger.warning(f"Server error {response.status_code}. Retrying in {wait_time}s ({attempt + 1}/{self.MAX_RETRIES})")
+                        time.sleep(wait_time)
+                        continue
+                
+                return response
+                
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait_time = self.RETRY_BACKOFF_BASE ** (attempt + 1)
+                    logger.warning(f"Timeout. Retrying in {wait_time}s ({attempt + 1}/{self.MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    continue
+            
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait_time = self.RETRY_BACKOFF_BASE ** (attempt + 1)
+                    logger.warning(f"Request error: {e}. Retrying in {wait_time}s ({attempt + 1}/{self.MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    continue
+        
+        # All retries exhausted
+        if last_exception:
+            raise last_exception
+        
+        return None
         
     def search_vacancies(self, 
                         text: str = None,
@@ -77,24 +126,27 @@ class HeadHunterClient:
             if only_with_salary:
                 params['only_with_salary'] = 'true'
             
-            response = self.session.get(
+            response = self._request_with_retry(
+                'GET',
                 f"{self.BASE_URL}/vacancies",
                 params=params,
                 timeout=10
             )
-            response.raise_for_status()
             
-            data = response.json()
-            vacancies = data.get('items', [])
-            
-            logger.info(f"Найдено {len(vacancies)} вакансий по запросу '{text}'")
-            return vacancies
+            if response and response.status_code == 200:
+                data = response.json()
+                vacancies = data.get('items', [])
+                logger.info(f"Найдено {len(vacancies)} вакансий по запросу '{text}'")
+                return vacancies
+            else:
+                logger.error(f"Failed to search vacancies: {response.status_code if response else 'No response'}")
+                return []
             
         except requests.exceptions.Timeout:
-            logger.error("Timeout при поиске вакансий")
+            logger.error("Timeout при поиске вакансий после всех попыток")
             return []
         except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при поиске вакансий: {e}")
+            logger.error(f"Ошибка при поиске вакансий после всех попыток: {e}")
             return []
         except Exception as e:
             logger.error(f"Неожиданная ошибка при поиске вакансий: {e}")
@@ -103,17 +155,23 @@ class HeadHunterClient:
     def get_vacancy_details(self, vacancy_id: str) -> Optional[Dict]:
         """Получить детальную информацию о вакансии"""
         try:
-            response = self.session.get(
+            response = self._request_with_retry(
+                'GET',
                 f"{self.BASE_URL}/vacancies/{vacancy_id}",
                 timeout=10
             )
-            response.raise_for_status()
-            return response.json()
+            
+            if response and response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Failed to get vacancy {vacancy_id}: {response.status_code if response else 'No response'}")
+                return None
+                
         except requests.exceptions.Timeout:
-            logger.error(f"Timeout при получении вакансии {vacancy_id}")
+            logger.error(f"Timeout при получении вакансии {vacancy_id} после всех попыток")
             return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при получении вакансии {vacancy_id}: {e}")
+            logger.error(f"Ошибка при получении вакансии {vacancy_id} после всех попыток: {e}")
             return None
         except Exception as e:
             logger.error(f"Неожиданная ошибка при получении вакансии {vacancy_id}: {e}")
@@ -156,11 +214,18 @@ class HeadHunterClient:
                 'message': cover_letter
             }
             
-            response = self.session.post(
+            response = self._request_with_retry(
+                'POST',
                 f"{self.BASE_URL}/negotiations",
                 json=data,
                 timeout=10
             )
+            
+            if not response:
+                return {
+                    'success': False,
+                    'message': 'Не удалось отправить отклик после нескольких попыток'
+                }
             
             if response.status_code == 201:
                 logger.info(f"Успешный отклик на вакансию {vacancy_id}")
@@ -196,13 +261,13 @@ class HeadHunterClient:
                 }
                 
         except requests.exceptions.Timeout:
-            logger.error("Timeout при отклике на вакансию")
+            logger.error("Timeout при отклике на вакансию после всех попыток")
             return {
                 'success': False,
                 'message': 'Превышено время ожидания. Попробуйте позже.'
             }
         except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при отклике на вакансию {vacancy_id}: {e}")
+            logger.error(f"Ошибка при отклике на вакансию {vacancy_id} после всех попыток: {e}")
             return {
                 'success': False,
                 'message': f'Ошибка соединения: {str(e)}'
@@ -221,19 +286,23 @@ class HeadHunterClient:
                 logger.warning("Нет токена авторизации")
                 return []
             
-            response = self.session.get(
+            response = self._request_with_retry(
+                'GET',
                 f"{self.BASE_URL}/resumes/mine",
                 timeout=10
             )
-            response.raise_for_status()
             
-            return response.json().get('items', [])
+            if response and response.status_code == 200:
+                return response.json().get('items', [])
+            else:
+                logger.error(f"Failed to get resumes: {response.status_code if response else 'No response'}")
+                return []
             
         except requests.exceptions.Timeout:
-            logger.error("Timeout при получении резюме")
+            logger.error("Timeout при получении резюме после всех попыток")
             return []
         except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при получении резюме: {e}")
+            logger.error(f"Ошибка при получении резюме после всех попыток: {e}")
             return []
         except Exception as e:
             logger.error(f"Неожиданная ошибка при получении резюме: {e}")
